@@ -1,11 +1,13 @@
+#include <WiFi.h>
 #include <Wire.h>
 #include <PN532_I2C.h>
 #include <PN532.h>
 #include <NfcAdapter.h>
+#include <PubSubClient.h>
 
 // Pin definitions and button address
 #define IR_SENSOR_PIN 16
-#define SUCCESSFULLY_DETECTED_LED_PIN 2
+#define SUCCESSFULLY_DETECTED_LED_PIN 19
 #define SERIAL_SENT_LED_PIN 17
 #define ERROR_INDICATOR_LED_PIN 18
 #define PN532_RESET_TRANSISTOR_PIN 4
@@ -17,6 +19,8 @@
 // Create PN532 instance
 PN532_I2C pn532i2c(Wire);
 PN532 nfc(pn532i2c);
+WiFiClient espClient;
+PubSubClient client(espClient);
 
 // Task handles
 TaskHandle_t irTaskHandle;
@@ -46,10 +50,53 @@ enum LedSuccessState
   LED_NFC_DETECTED // 255 brightness
 };
 
+const char* ssid = "REPLACE_YOUR_SSID_HERE";
+const char* password = "REPLACE_PASSWORD_HERE";
+const char* mqtt_server = "REPLACE_SERVER_ADDRESS_HERE";
+
 unsigned short failedAttempts = 0;
 volatile bool isReaderConnected = false;
 volatile MachineState currentState = UNAVAIL_STATE; // Default state
 String cardUID = "";                                // Stores the UID when in AVAIL_STATE
+
+void setupWifi() {
+  delay(10);
+  // We start by connecting to a WiFi network
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (client.connect("ESP8266Client")) {
+      Serial.println("connected");
+      // Subscribe
+      // client.subscribe("esp32/output");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
 
 bool connectToCard()
 {
@@ -137,6 +184,9 @@ void setup()
     isReaderConnected = connectToCard();
   }
 
+  setupWifi();
+  client.setServer(mqtt_server, 1883);
+
   digitalWrite(ERROR_INDICATOR_LED_PIN, LOW);
 
   // Create tasks
@@ -144,7 +194,7 @@ void setup()
   xTaskCreatePinnedToCore(nfcTask, "NFC Reader Task", 6500, NULL, 1, &nfcTaskHandle, 1);
   xTaskCreatePinnedToCore(buttonTask, "External Button Hardware Task", 3000, NULL, 1, &buttonTaskHandle, 1);
   xTaskCreatePinnedToCore(queueManagerTask, "Queue Manager Task", 2000, NULL, 1, &queueTaskHandle, 0);
-  xTaskCreatePinnedToCore(serialTask, "Serial Task", 3000, NULL, 1, &serialTaskHandle, 0);
+  xTaskCreatePinnedToCore(serialTask, "Serial Task", 5500, NULL, 1, &serialTaskHandle, 0);
   xTaskCreatePinnedToCore(ledTask, "LED Control Task", 2000, NULL, 1, &ledTaskHandle, 0);
 }
 
@@ -322,10 +372,16 @@ void serialTask(void *parameter)
 
   while (true)
   {
+    if (!client.connected()) {
+      reconnect();
+    }
+  
+    client.loop();
 
     if (xQueueReceive(stringQueue, buffer, portMAX_DELAY))
     {
       Serial.println(buffer);
+      client.publish("esp32/detected-card", buffer);
 
       digitalWrite(SERIAL_SENT_LED_PIN, HIGH);
       vTaskDelay(25 / portTICK_PERIOD_MS);
